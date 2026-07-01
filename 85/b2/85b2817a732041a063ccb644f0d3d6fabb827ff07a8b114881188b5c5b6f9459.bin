@@ -1,0 +1,214 @@
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
+import os, subprocess, random
+
+# Rendu NATIF 4K (plus net qu'un upscale) + ProRes 4444 alpha = transparent.
+# Derive de credit_final.py. SCALE applique a toutes les dimensions/polices.
+SCALE = 2
+BASE_OUT = "/Users/zenray/Downloads/DJI/16 Juin 2026/BestOf/Videos/InterviewPablo/"
+W, H  = 1920 * SCALE, 1080 * SCALE   # 3840 x 2160
+FPS   = 24
+
+FONT_REG = "/Users/zenray/Library/Fonts/AnthropicSerif-Regular.ttf"
+FONT_ITA = "/Users/zenray/Library/Fonts/AnthropicSerif-Italic.ttf"
+FONT_SANS_MED = "/Users/zenray/Library/Fonts/AnthropicSans-Medium.ttf"
+
+WHITE = (255, 255, 255)
+DIM   = (170, 170, 170)
+
+SHADOW_R   = 7  * SCALE
+OFFSET_IN  = 160 * SCALE
+OFFSET_OUT = 70 * SCALE
+WORD_GAP   = 20 * SCALE
+LINE_GAP   = 14 * SCALE
+
+
+def ease_out_quint(t):
+    t = max(0.0, min(1.0, t))
+    return 1 - (1 - t) ** 5
+
+def smoothstep(t):
+    t = max(0.0, min(1.0, t))
+    return t * t * (3 - 2 * t)
+
+def smootherstep(t):
+    t = max(0.0, min(1.0, t))
+    return t * t * t * (t * (6 * t - 15) + 10)
+
+
+def draw_word(canvas, text, x, y, font, color, alpha):
+    if alpha <= 0 or not text.strip():
+        return
+    bb = font.getbbox(text, anchor="ls")
+    if bb[2] - bb[0] <= 0:
+        return
+    pad = SHADOW_R * 2 + 4
+    lw  = bb[2] - bb[0] + pad * 2
+    lh  = bb[3] - bb[1] + pad * 2
+    lx  = pad - bb[0]
+    ly  = pad - bb[1]
+
+    shd_img = Image.new("RGBA", (lw, lh), (0, 0, 0, 0))
+    ImageDraw.Draw(shd_img).text((lx, ly), text, font=font,
+                                  fill=(0, 0, 0, alpha), anchor="ls")
+    shd_img = shd_img.filter(ImageFilter.GaussianBlur(SHADOW_R))
+
+    txt_img = Image.new("RGBA", (lw, lh), (0, 0, 0, 0))
+    r, g, b = color
+    ImageDraw.Draw(txt_img).text((lx, ly), text, font=font,
+                                  fill=(r, g, b, alpha), anchor="ls")
+
+    combined = Image.alpha_composite(shd_img, txt_img)
+
+    dx = int(x + bb[0] - pad)
+    dy = int(y + bb[1] - pad)
+    cx2, cy2 = max(0, dx), max(0, dy)
+    cr = combined.crop((cx2 - dx, cy2 - dy,
+                        min(combined.width,  W - dx),
+                        min(combined.height, H - dy)))
+    if cr.width > 0 and cr.height > 0:
+        canvas.alpha_composite(cr, (cx2, cy2))
+
+
+def generate(lines_spec, out_name, target_s, seed=1, anim_f=8, exit_f=7):
+    random.seed(seed)
+    OUT_DIR  = f"/tmp/c4k_{seed}"
+    OUT_FILE = BASE_OUT + out_name
+    TARGET   = int(FPS * target_s)
+
+    os.makedirs(OUT_DIR, exist_ok=True)
+    for f in os.listdir(OUT_DIR): os.remove(f"{OUT_DIR}/{f}")
+
+    fc = {}
+    def gf(fp, sz):
+        k = (fp, sz)
+        if k not in fc:
+            fc[k] = ImageFont.truetype(fp, sz)
+        return fc[k]
+
+    def line_h(line):
+        return max(gf(fp,sz).getmetrics()[0] + gf(fp,sz).getmetrics()[1]
+                   for _, fp, sz, _ in line)
+
+    lhs      = [line_h(l) for l in lines_spec]
+    total_h  = sum(lhs) + LINE_GAP * (len(lhs) - 1)
+    y_top    = (H - total_h) // 2
+
+    baselines = []
+    y = y_top
+    for i, line in enumerate(lines_spec):
+        ascent = max(gf(fp,sz).getmetrics()[0] for _,fp,sz,_ in line)
+        baselines.append(y + ascent)
+        y += lhs[i] + LINE_GAP
+
+    line_data = []
+    for li, line in enumerate(lines_spec):
+        bl = baselines[li]
+        words = []
+        for text, fp, sz, col in line:
+            f = gf(fp, sz)
+            words.append({'text': text, 'font': f, 'color': col,
+                          'adv': f.getlength(text)})
+        total_w = sum(w['adv'] for w in words) + WORD_GAP * (len(words) - 1)
+        x = (W - total_w) // 2
+        for w in words:
+            w['x'] = x
+            w['y'] = bl
+            x += w['adv'] + WORD_GAP
+        line_data.append(words)
+
+    flat = [w for line in line_data for w in line]
+    n    = len(flat)
+
+    WORD_DELAY = 1
+    LINE_PAUSE = 1
+    EXIT_DELAY = 1
+
+    line_starts = []
+    t = 0
+    for ws in line_data:
+        line_starts.append(t)
+        t += (len(ws) - 1) * WORD_DELAY + anim_f + LINE_PAUSE
+
+    last_li        = len(line_data) - 1
+    line_last_done = (line_starts[last_li]
+                      + (len(line_data[last_li]) - 1) * WORD_DELAY + anim_f)
+    exit_tail  = (n - 1) * EXIT_DELAY + exit_f
+    HOLD_F     = max(TARGET - line_last_done - exit_tail, 2)
+    all_done   = line_last_done + HOLD_F
+    TOTAL      = all_done + (n - 1) * EXIT_DELAY + exit_f
+
+    print(f"  {out_name}: {TOTAL} frames = {TOTAL/FPS:.2f}s  hold={HOLD_F}f")
+
+    DIRS = ['left', 'right', 'top']
+    dirs = [[random.choice(DIRS) for _ in ws] for ws in line_data]
+
+    for frame in range(TOTAL):
+        img  = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        eidx = 0
+        for li, ws in enumerate(line_data):
+            ls = line_starts[li]
+            for wi, word in enumerate(ws):
+                fx, fy = word['x'], word['y']
+                e_in   = frame - (ls + wi * WORD_DELAY)
+                if e_in < 0:
+                    eidx += 1
+                    continue
+                if e_in >= anim_f:
+                    px, py = fx, fy
+                    alpha  = 255
+                else:
+                    raw   = e_in / anim_f
+                    t_pos = ease_out_quint(raw)
+                    t_alf = smoothstep(raw)
+                    d  = dirs[li][wi]
+                    ox = (-OFFSET_IN if d == 'left'
+                          else OFFSET_IN if d == 'right'
+                          else 0)
+                    oy = -OFFSET_IN if d == 'top' else 0
+                    px    = int(fx + ox * (1 - t_pos))
+                    py    = int(fy + oy * (1 - t_pos))
+                    alpha = int(255 * t_alf)
+                e_out = frame - (all_done + eidx * EXIT_DELAY)
+                dy    = 0
+                if e_out >= 0:
+                    t_out = smootherstep(min(e_out / exit_f, 1.0))
+                    alpha = int(255 * (1 - t_out))
+                    dy    = int(-OFFSET_OUT * smoothstep(min(e_out / exit_f, 1.0)))
+                draw_word(img, word['text'], px, py + dy,
+                          word['font'], word['color'], alpha)
+                eidx += 1
+        img.save(f"{OUT_DIR}/frame_{frame:04d}.png")
+
+    subprocess.run([
+        "ffmpeg", "-y", "-r", str(FPS),
+        "-i", f"{OUT_DIR}/frame_%04d.png",
+        "-c:v", "prores_ks", "-profile:v", "4444",
+        "-pix_fmt", "yuva444p10le", OUT_FILE
+    ], check=True, capture_output=True)
+    print(f"  -> {OUT_FILE}")
+
+
+S = SCALE
+# ═══════════════════════════════════════════════════════════════════
+# 1. Short Interview — 8s, titre "AI in the process of creation."
+generate([
+    [("Short", FONT_ITA, 44*S, DIM),
+     ("Interview", FONT_ITA, 44*S, DIM)],
+    [("AI", FONT_SANS_MED, 64*S, WHITE),
+     ("in", FONT_SANS_MED, 64*S, WHITE),
+     ("the", FONT_SANS_MED, 64*S, WHITE),
+     ("process", FONT_SANS_MED, 64*S, WHITE),
+     ("of", FONT_SANS_MED, 64*S, WHITE),
+     ("creation.", FONT_SANS_MED, 64*S, WHITE)],
+    [("Pablo", FONT_REG, 60*S, WHITE),
+     ("-", FONT_REG, 60*S, WHITE),
+     ("Matthieu", FONT_REG, 60*S, WHITE)],
+], "Credit Short Interview.mov", target_s=8.0, seed=11, anim_f=8, exit_f=7)
+
+# ═══════════════════════════════════════════════════════════════════
+# 2. Realisation — 3s, "Matthieu Huguet, Realisation"
+generate([
+    [("Matthieu",    FONT_SANS_MED, 72*S, WHITE),
+     ("Huguet,",     FONT_SANS_MED, 72*S, WHITE),
+     ("Realisation", FONT_SANS_MED, 72*S, WHITE)],
+], "Credit Realisation.mov", target_s=3.0, seed=5, anim_f=8, exit_f=7)
