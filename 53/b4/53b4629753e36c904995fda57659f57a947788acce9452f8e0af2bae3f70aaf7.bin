@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""LUT cinema teal & orange (Tenet/Dune) PARAMETRIQUE - anti-delave.
+
+Pas de moyenne par luminance (= aplat mou). Vrai grade :
+- contraste en S par canal (du punch, des noirs profonds)
+- noirs legerement leves (film) mais PAS laiteux
+- ombres -> teal, moyens/peaux -> orange, hautes lumieres -> ambre chaud
+- saturation gardee (~0.9), orange booste, vert desature (desert)
+- highlights chauds et non delaves (pas de creme verdatre)
+"""
+import sys, os
+import numpy as np
+from PIL import Image
+
+OUT = os.path.join(os.path.dirname(__file__), "..", "LUTs", "VilleneuveDune.cube")
+FOOTAGE = "/tmp/footage_frame.png"
+N = 65
+REC709 = np.array([0.2126, 0.7152, 0.0722])
+
+P = dict(
+    CONTRAST=1.45,   # pente du S (1 = aucun, >1 = plus de punch)
+    PIVOT=0.46,
+    BLACK=0.025,     # leve des noirs (film) - petit, sinon delave
+    WHITE=0.915,     # ciel contenu en haze chaude, pas de blanc plat
+    SHADOW_TEAL=0.070,   # cyan/teal dans les ombres
+    MID_ORANGE=0.090,    # orange dans les moyens/peaux
+    HIGH_AMBER=0.075,    # ambre chaud dans les hautes lumieres
+    SAT=0.90,            # saturation globale
+    ORANGE_BOOST=1.30,   # gonfle la satu des tons chair/orange
+    GREEN_TAME=0.97,     # desature quasi total + jaunit le vert (desert)
+)
+
+
+def smoothstep(a, b, x):
+    t = np.clip((x - a) / (b - a), 0, 1)
+    return t * t * (3 - 2 * t)
+
+
+def s_curve(x, k, pivot):
+    # sigmoide normalisee centree sur pivot, garde [0,1]
+    x = np.clip(x, 0, 1)
+    g = 1.0 / (1.0 + np.exp(-k * (x - pivot)))
+    g0 = 1.0 / (1.0 + np.exp(-k * (0 - pivot)))
+    g1 = 1.0 / (1.0 + np.exp(-k * (1 - pivot)))
+    return (g - g0) / (g1 - g0)
+
+
+def grade(arr, p):
+    a = np.clip(arr, 0, 1).astype(np.float64)
+    r, g, b = a[..., 0], a[..., 1], a[..., 2]
+    lum = a @ REC709
+
+    # poids tonaux
+    sh = 1 - smoothstep(0.0, 0.5, lum)
+    hi = smoothstep(0.5, 1.0, lum)
+    mid = np.clip(1 - np.abs(lum - 0.45) * 2.2, 0, 1)
+
+    # --- split tone (avant contraste, sur la couleur lineaire d'affichage) ---
+    # ombres -> teal (moins de rouge, un peu plus de vert/bleu)
+    r = r - p["SHADOW_TEAL"] * sh
+    g = g + p["SHADOW_TEAL"] * 0.35 * sh
+    b = b + p["SHADOW_TEAL"] * 0.8 * sh
+    # moyens/peaux -> orange (R up, B down, G leger up pour rester orange pas rouge)
+    r = r + p["MID_ORANGE"] * mid
+    g = g + p["MID_ORANGE"] * 0.30 * mid
+    b = b - p["MID_ORANGE"] * 0.85 * mid
+    # hautes lumieres -> ambre chaud (pas creme verte)
+    r = r + p["HIGH_AMBER"] * hi
+    g = g + p["HIGH_AMBER"] * 0.18 * hi
+    b = b - p["HIGH_AMBER"] * 0.75 * hi
+
+    a = np.stack([r, g, b], -1)
+
+    # --- contraste en S par canal (punch + noirs profonds) ---
+    a = s_curve(a, p["CONTRAST"] * 6.0, p["PIVOT"])
+
+    # --- niveau film : noirs leves, blancs ~contenus ---
+    a = p["BLACK"] + (p["WHITE"] - p["BLACK"]) * a
+
+    # --- saturation : globale + boost orange + tame vert ---
+    lum2 = (a @ REC709)[..., None]
+    sat = np.full(a.shape[:-1] + (1,), p["SAT"])
+    rr, gg, bb = a[..., 0], a[..., 1], a[..., 2]
+    # masque orange/peau : rouge dominant, bleu faible
+    orange = np.clip((rr - bb) * 2.0, 0, 1) * np.clip(1 - np.abs(rr - gg * 1.6), 0, 1)
+    sat = sat * (1 + (p["ORANGE_BOOST"] - 1) * orange[..., None])
+    # masque vert large : capte aussi le vert vif (g > b et g >= r)
+    greenness = np.clip(np.minimum(gg - bb, gg - rr * 0.9), 0, 1)
+    gm = np.clip(greenness * 10, 0, 1)
+    sat = sat * (1 - p["GREEN_TAME"] * gm)[..., None]
+    a = lum2 + (a - lum2) * sat
+    # le vert restant glisse vers l'olive/khaki chaud (R up, G down, B down)
+    if p["GREEN_TAME"] > 0:
+        a[..., 0] = a[..., 0] + 0.10 * p["GREEN_TAME"] * gm
+        a[..., 1] = a[..., 1] - 0.05 * p["GREEN_TAME"] * gm
+        a[..., 2] = a[..., 2] - 0.06 * p["GREEN_TAME"] * gm
+
+    return np.clip(a, 0, 1)
+
+
+def write_cube(p):
+    grid = np.linspace(0, 1, N)
+    R, G, B = np.meshgrid(grid, grid, grid, indexing="ij")
+    pts = np.stack([R, G, B], -1).reshape(1, -1, 3)
+    out = grade(pts, p)[0].reshape(N, N, N, 3)
+    head = ['# Cine teal&orange parametrique (anti-delave)', f'# {p}',
+            'TITLE "Villeneuve Dune"', f"LUT_3D_SIZE {N}",
+            "DOMAIN_MIN 0.0 0.0 0.0", "DOMAIN_MAX 1.0 1.0 1.0", ""]
+    lines = [f"{out[ir,ig,ib,0]:.6f} {out[ir,ig,ib,1]:.6f} {out[ir,ig,ib,2]:.6f}"
+             for ib in range(N) for ig in range(N) for ir in range(N)]
+    os.makedirs(os.path.dirname(OUT), exist_ok=True)
+    open(OUT, "w").write("\n".join(head + lines) + "\n")
+
+
+def load(path, w=1000):
+    im = Image.open(path).convert("RGB")
+    if im.width > w:
+        im = im.resize((w, int(im.height * w / im.width)))
+    return np.asarray(im, np.float64) / 255.0
+
+
+def preview(p, out="/tmp/cine_preview.png"):
+    src = load(FOOTAGE)
+    g = grade(src, p)
+    h, w, _ = src.shape
+    sep = np.ones((10, w, 3))
+    combo = np.concatenate([src, sep, g], 0)
+    Image.fromarray((combo * 255).astype(np.uint8)).save(out)
+
+
+if __name__ == "__main__":
+    mode = sys.argv[1] if len(sys.argv) > 1 else "preview"
+    if mode == "preview":
+        preview(P); print("preview /tmp/cine_preview.png")
+    elif mode == "final":
+        write_cube(P); print("LUT ecrite", os.path.abspath(OUT))
